@@ -80,6 +80,25 @@ def parse_edges(path: Path, limit: Optional[int] = None) -> Iterator[Tuple[int, 
                 return
 
 
+def sample_edges(path: Path, limit: int, seed: int = 42) -> List[Tuple[int, int, float]]:  # uniform random sample of `limit` edges
+    """Reservoir-sample `limit` edges from the whole file in one pass.
+
+    SNAP files are sorted by source vertex, so the first `limit` lines contain only a few thousand
+    hub-like sources and distort the Type1/2/3 mix. The paper shuffles the entire dataset, so a
+    uniform sample is much closer to its setup.
+    """
+    rng = random.Random(seed)  # seeded -> reproducible sample
+    res: List[Tuple[int, int, float]] = []  # the reservoir
+    for i, e in enumerate(parse_edges(path)):  # i = number of edges seen before this one
+        if i < limit:  # fill the reservoir first
+            res.append(e)
+        else:
+            j = rng.randrange(i + 1)  # keep edge i with probability limit/(i+1)
+            if j < limit:
+                res[j] = e  # replace a random earlier pick
+    return res
+
+
 def download_dataset(name: str, data_dir: Path) -> Path:  # download a dataset once and cache it in data_dir
     spec = DATASETS[name]
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -429,6 +448,7 @@ class GraphTango(_Graph):  # the hybrid format from the paper: representation ch
         return -1
 
     def _build_index(self, v: Vertex) -> None:  # build a hash index over the current edge array
+        self._drop_index(v)  # bank the old index's work counters before it is replaced (else work() undercounts)
         idx = self._index_cls(min_slots=2 * v.capacity)  # size the table at 2x the array capacity
         for i, (d, _) in enumerate(v.edges):
             idx.put(d, i)  # map each neighbor id -> its array position
@@ -668,6 +688,8 @@ def run_experiment(label: str, edges: list, directed: bool, batch_size: int, th0
     edges = list(edges)  # shuffle edges so arrival order is random (seeded)
     rng.shuffle(edges)
     n = len(edges)
+    if batch_size > n:
+        print(f"(note: batch_size {batch_size:,} > {n:,} edges -> only one batch; use a smaller --batch-size)")
     print(f"\n=== {label}: edges={n:,} batch_size={batch_size:,} "
           f"max updates to one vertex in a batch={batch_since_max(edges, batch_size):,} ===")
     makers = {"GraphTango": lambda: GraphTango(directed, th0, th1, index=index),  # factories for the three formats under comparison
@@ -845,6 +867,8 @@ def main() -> None:  # command-line entry point
             s.add_argument("--seed", type=int, default=42)
             s.add_argument("--index", choices=list(INDEX_IMPLS), default="dict",
                            help="Type-3 index: dict (fast) or cfh (paper-style cache-friendly table)")
+            s.add_argument("--head", action="store_true",
+                           help="use the first --limit lines instead of a random sample (biased: SNAP files are sorted by source)")
             s.add_argument("--csv", help="append results to this CSV")
             s.add_argument("--plot", help="save a bar chart PNG (needs matplotlib)")
     s = sub.add_parser("synthetic", help="offline experiment on generated graphs")
@@ -872,7 +896,12 @@ def main() -> None:  # command-line entry point
     else:
         for name in (ds if a.dataset == "all" else [a.dataset]):  # 'all' runs every dataset, otherwise just the chosen one
             path = download_dataset(name, a.data_dir)
-            edges = list(parse_edges(path, limit=a.limit or None))  # limit=0 means no limit (read the whole file)
+            if not a.limit:  # limit=0 means no limit (read the whole file)
+                edges = list(parse_edges(path))
+            elif a.head:  # first N lines: biased, kept for comparison
+                edges = list(parse_edges(path, limit=a.limit))
+            else:  # default: uniform random sample of N edges from the whole file
+                edges = sample_edges(path, a.limit, a.seed)
             if not edges:
                 sys.exit("No edges were parsed. Check the dataset file.")
             plot = a.plot.replace(".png", f"_{name}.png") if a.plot and a.dataset == "all" else a.plot
